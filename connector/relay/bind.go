@@ -87,7 +87,13 @@ func (c *relayConnector) bind(conn net.Conn, cmd relay.CmdType, network, address
 		Cmd:     cmd,
 	}
 
-	if c.options.Auth != nil {
+	if c.md.nodeID {
+		// pixelated fork: announce a stable self-derived worker id (egress IP,
+		// random fallback) as the relay user, for sticky egress grouping.
+		req.Features = append(req.Features, &relay.UserAuthFeature{
+			Username: nodeID(),
+		})
+	} else if c.options.Auth != nil {
 		pwd, _ := c.options.Auth.Password()
 		req.Features = append(req.Features, &relay.UserAuthFeature{
 			Username: c.options.Auth.Username(),

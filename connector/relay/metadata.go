@@ -11,6 +11,7 @@ import (
 type metadata struct {
 	connectTimeout time.Duration
 	noDelay        bool
+	nodeID         bool // pixelated: announce self-egress-IP (or random) as relay auth user
 	muxCfg         *mux.Config
 }
 
@@ -22,6 +23,7 @@ func (c *relayConnector) parseMetadata(md mdata.Metadata) (err error) {
 
 	c.md.connectTimeout = mdutil.GetDuration(md, connectTimeout)
 	c.md.noDelay = mdutil.GetBool(md, noDelay)
+	c.md.nodeID = mdutil.GetBool(md, "nodeID", "nodeid")
 
 	c.md.muxCfg = &mux.Config{
 		Version:           mdutil.GetInt(md, "mux.version"),
