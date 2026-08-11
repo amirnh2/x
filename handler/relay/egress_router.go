@@ -36,9 +36,17 @@ import (
 	"github.com/go-gost/x/internal/util/mux"
 )
 
-// stickyEnabled is an off-switch: set GOST_STICKY_EGRESS=0 in the relay's
-// environment to fall back to plain per-bind forwarding without a rebuild.
-var stickyEnabled = os.Getenv("GOST_STICKY_EGRESS") != "0"
+// stickyEnabled is OPT-IN: the fork behaves exactly like stock gost unless
+// GOST_STICKY_EGRESS is explicitly set to a truthy value (1/true/yes/on) in the
+// relay's environment. So this binary is safe to reuse for anything else — no
+// peek, no routing, no surprise — until sticky egress is deliberately enabled.
+var stickyEnabled = func() bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("GOST_STICKY_EGRESS"))) {
+	case "1", "true", "yes", "on":
+		return true
+	}
+	return false
+}()
 
 // maxPeek caps how many header bytes we read before giving up (slowloris guard).
 const maxPeek = 64 << 10
@@ -138,7 +146,7 @@ func (r *egressRegistry) pick(addr, key string) mux.Session {
 // (nginx's X-Real-IP, falling back to the first X-Forwarded-For hop) and the
 // Host. On any error it returns whatever was read plus empty fields, and the
 // caller forwards without routing.
-func peekHTTPHead(conn net.Conn) (head []byte, clientIP, host string, isHTTP bool) {
+func peekHTTPHead(conn net.Conn) (head []byte, clientIP, host string) {
 	conn.SetReadDeadline(time.Now().Add(peekTimeout))
 	defer conn.SetReadDeadline(time.Time{})
 
@@ -160,9 +168,8 @@ func peekHTTPHead(conn net.Conn) (head []byte, clientIP, host string, isHTTP boo
 
 	req, err := http.ReadRequest(bufio.NewReader(bytes.NewReader(buf)))
 	if err != nil {
-		return // isHTTP=false: no complete request head within the deadline/cap
+		return // not HTTP / no complete head within the deadline: caller forwards as-is
 	}
-	isHTTP = true
 	host = req.Host
 	clientIP = req.Header.Get("X-Real-IP")
 	if clientIP == "" {
