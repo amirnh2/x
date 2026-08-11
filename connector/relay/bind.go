@@ -113,10 +113,13 @@ func (c *relayConnector) bind(conn net.Conn, cmd relay.CmdType, network, address
 	fa := &relay.AddrFeature{}
 	if network != "unix" {
 		if address == "" {
-	        address = "0.0.0.0:0"
-	    } else if h, _, e := net.SplitHostPort(address); e == nil && h == "" {
-	        address = net.JoinHostPort("0.0.0.0", address)
-	    }
+			address = "0.0.0.0:0"
+		} else if h, p, e := net.SplitHostPort(address); e == nil && h == "" {
+			// pixelated fork: upstream v0.15.2 bug — JoinHostPort's 2nd arg is the
+			// PORT, but upstream passed the whole address, turning ":9596" into the
+			// bogus "0.0.0.0::9596" and breaking every empty-host rtcp BIND. Use p.
+			address = net.JoinHostPort("0.0.0.0", p)
+		}
 	}
 	fa.ParseFrom(address)
 	req.Features = append(req.Features, fa)
