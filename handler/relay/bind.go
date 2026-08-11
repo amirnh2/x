@@ -187,14 +187,14 @@ func (h *relayHandler) bindTCP(ctx context.Context, conn net.Conn, network, addr
 	}
 	defer session.Close()
 
-	// pixelated fork: only binds that announced a worker id get sticky egress
-	// routing. That id is the "user" the relay connector sends, and ONLY the
-	// worker->entry ws chain sets it (nodeID connector flag). Every other port
-	// forwarded through this relay (controller 9632, wallet 9695, softether,
-	// tgproxy, ...) presents no user -> sticky=false -> plain forward with no
-	// HTTP peek, i.e. unchanged behavior. GOST_STICKY_EGRESS=0 disables globally.
-	workerID := string(ctxvalue.ClientIDFromContext(ctx))
-	sticky := stickyEnabled && workerID != ""
+	// pixelated fork: sticky egress routing runs ONLY for binds that announced a
+	// node id (a dedicated relay MetadataFeature, distinct from auth). Any bind
+	// without one — every other port through this relay, or any reuse of this
+	// binary — is plain-forwarded with no peek, i.e. stock gost. There is no env
+	// switch: the node id's presence (client-side, set by the generator) is the
+	// only gate.
+	workerID, _ := ctx.Value(egressNodeIDKey{}).(string)
+	sticky := workerID != ""
 	if sticky {
 		egress.add(ln.Addr().String(), workerID, session)
 		defer egress.remove(ln.Addr().String(), workerID, session)

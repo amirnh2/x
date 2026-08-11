@@ -89,11 +89,13 @@ func (c *relayConnector) bind(conn net.Conn, cmd relay.CmdType, network, address
 
 	if c.md.nodeID {
 		// pixelated fork: announce a stable self-derived worker id (egress IP,
-		// random fallback) as the relay user, for sticky egress grouping.
-		req.Features = append(req.Features, &relay.UserAuthFeature{
-			Username: nodeID(),
+		// random fallback) in a DEDICATED metadata KV — not the auth username — so
+		// the relay never mistakes a real login for a sticky tunnel id.
+		req.Features = append(req.Features, &relay.MetadataFeature{
+			KVs: map[string]string{relay_util.MetaKeyNodeID: nodeID()},
 		})
-	} else if c.options.Auth != nil {
+	}
+	if c.options.Auth != nil {
 		pwd, _ := c.options.Auth.Password()
 		req.Features = append(req.Features, &relay.UserAuthFeature{
 			Username: c.options.Auth.Username(),

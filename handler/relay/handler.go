@@ -17,6 +17,7 @@ import (
 	"github.com/go-gost/core/recorder"
 	"github.com/go-gost/relay"
 	xctx "github.com/go-gost/x/ctx"
+	relay_util "github.com/go-gost/x/internal/util/relay"
 	stats_util "github.com/go-gost/x/internal/util/stats"
 	tls_util "github.com/go-gost/x/internal/util/tls"
 	rate_limiter "github.com/go-gost/x/limiter/rate"
@@ -238,6 +239,7 @@ func (h *relayHandler) Handle(ctx context.Context, conn net.Conn, opts ...handle
 	var address string
 	var addrFeature *relay.AddrFeature
 	var networkID relay.NetworkID
+	var nodeID string // pixelated fork: sticky-egress tunnel id (metadata KV)
 	for _, f := range req.Features {
 		switch f.Type() {
 		case relay.FeatureUserAuth:
@@ -251,6 +253,10 @@ func (h *relayHandler) Handle(ctx context.Context, conn net.Conn, opts ...handle
 		case relay.FeatureNetwork:
 			if feature, _ := f.(*relay.NetworkFeature); feature != nil {
 				networkID = feature.Network
+			}
+		case relay.FeatureMetadata:
+			if feature, _ := f.(*relay.MetadataFeature); feature != nil {
+				nodeID = feature.KVs[relay_util.MetaKeyNodeID]
 			}
 		}
 	}
@@ -272,11 +278,12 @@ func (h *relayHandler) Handle(ctx context.Context, conn net.Conn, opts ...handle
 		ctx = xctx.ContextWithClientID(ctx, xctx.ClientID(clientID))
 	}
 
-	// pixelated fork: with no Auther, still propagate the client-declared user as
-	// the client id so the BIND endpoint can group a worker's sessions for sticky
-	// egress routing (see egress_router.go). The generator sets user = worker IP.
-	if h.options.Auther == nil && user != "" {
-		ctx = xctx.ContextWithClientID(ctx, xctx.ClientID(user))
+	// pixelated fork: carry the sticky-egress node id (a dedicated metadata KV,
+	// distinct from auth) to the BIND endpoint. Empty ⇒ the relay does no sticky
+	// routing for this bind (plain forward), so this is invisible to any use that
+	// doesn't send the id.
+	if nodeID != "" {
+		ctx = context.WithValue(ctx, egressNodeIDKey{}, nodeID)
 	}
 
 	network := networkID.String()

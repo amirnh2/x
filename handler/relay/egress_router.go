@@ -26,7 +26,6 @@ import (
 	"bytes"
 	"net"
 	"net/http"
-	"os"
 	"strings"
 	"sync"
 	"time"
@@ -36,25 +35,21 @@ import (
 	"github.com/go-gost/x/internal/util/mux"
 )
 
-// stickyEnabled is OPT-IN: the fork behaves exactly like stock gost unless
-// GOST_STICKY_EGRESS is explicitly set to a truthy value (1/true/yes/on) in the
-// relay's environment. So this binary is safe to reuse for anything else — no
-// peek, no routing, no surprise — until sticky egress is deliberately enabled.
-var stickyEnabled = func() bool {
-	switch strings.ToLower(strings.TrimSpace(os.Getenv("GOST_STICKY_EGRESS"))) {
-	case "1", "true", "yes", "on":
-		return true
-	}
-	return false
-}()
+// egressNodeIDKey carries the worker's distinct sticky-egress node id (from the
+// relay MetadataFeature) from the handler through to the BIND endpoint. Kept out
+// of the auth path so a real login username is never taken for a tunnel id.
+//
+// There is no env switch: sticky routing happens iff a bind carried a node id.
+// A binary reused with no node ids is byte-for-byte stock gost.
+type egressNodeIDKey struct{}
 
 // maxPeek caps how many header bytes we read before giving up (slowloris guard).
 const maxPeek = 64 << 10
 
 // peekTimeout bounds the header read. Non-HTTP is rejected from its first bytes
-// (see startsLikeHTTP), so this never fires on real traffic — it only caps a peer
-// that connects and sends nothing (half-open), which a deadline-less read pins.
-const peekTimeout = 3 * time.Second
+// (see startsLikeHTTP) and real clients send at once, so this never fires on real
+// traffic — it only caps a peer that connects and sends nothing (half-open).
+const peekTimeout = 1 * time.Second
 
 // httpMethodPrefixes are the "METHOD " tokens an HTTP request line can begin with
 // (the ws upgrade is always GET). Used to reject non-HTTP from the first bytes.
