@@ -43,8 +43,10 @@ var stickyEnabled = os.Getenv("GOST_STICKY_EGRESS") != "0"
 // maxPeek caps how many header bytes we read before giving up (slowloris guard).
 const maxPeek = 64 << 10
 
-// peekTimeout bounds the header read; nginx sends the upgrade request at once.
-const peekTimeout = 10 * time.Second
+// peekTimeout bounds the header read. Real ws traffic from nginx arrives at once,
+// so this never fires on the happy path; it only caps half-open / stalled peers
+// that connect but never send, which a deadline-less read would pin for minutes.
+const peekTimeout = 3 * time.Second
 
 // egressRegistry holds the live mux sessions of every worker that has BIND'd a
 // given endpoint address, grouped by worker id, so an accepted connection can be
