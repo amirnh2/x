@@ -81,10 +81,11 @@ func (l *tcpListener) Close() error {
 type tcpHandler struct {
 	session  mux.Session
 	bindAddr string // registry key: the reuseport endpoint address (e.g. [::]:9596)
+	sticky   bool   // pixelated: peek+route this endpoint (worker ws only); else plain forward
 	options  handler.Options
 }
 
-func newTCPHandler(session mux.Session, bindAddr string, opts ...handler.Option) handler.Handler {
+func newTCPHandler(session mux.Session, bindAddr string, sticky bool, opts ...handler.Option) handler.Handler {
 	options := handler.Options{}
 	for _, opt := range opts {
 		opt(&options)
@@ -93,6 +94,7 @@ func newTCPHandler(session mux.Session, bindAddr string, opts ...handler.Option)
 	return &tcpHandler{
 		session:  session,
 		bindAddr: bindAddr,
+		sticky:   sticky,
 		options:  options,
 	}
 }
@@ -125,7 +127,7 @@ func (h *tcpHandler) Handle(ctx context.Context, conn net.Conn, opts ...handler.
 	// the pool is empty, or the request can't be parsed.
 	sess := h.session
 	var head []byte
-	if stickyEnabled {
+	if h.sticky {
 		var clientIP, host string
 		head, clientIP, host = peekHTTPHead(conn)
 		if clientIP != "" || host != "" {

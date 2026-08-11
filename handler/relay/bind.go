@@ -187,14 +187,18 @@ func (h *relayHandler) bindTCP(ctx context.Context, conn net.Conn, network, addr
 	}
 	defer session.Close()
 
-	// pixelated fork: register this worker's session so accepted connections can
-	// be routed to a consistently-chosen worker (see egress_router.go). Worker id
-	// is the "user" the client presented in the relay auth feature; empty until
-	// the generator sets it — then all sessions fall in one group and routing
-	// degrades to the existing kernel lottery (no regression).
+	// pixelated fork: only binds that announced a worker id get sticky egress
+	// routing. That id is the "user" the relay connector sends, and ONLY the
+	// worker->entry ws chain sets it (nodeID connector flag). Every other port
+	// forwarded through this relay (controller 9632, wallet 9695, softether,
+	// tgproxy, ...) presents no user -> sticky=false -> plain forward with no
+	// HTTP peek, i.e. unchanged behavior. GOST_STICKY_EGRESS=0 disables globally.
 	workerID := string(ctxvalue.ClientIDFromContext(ctx))
-	egress.add(ln.Addr().String(), workerID, session)
-	defer egress.remove(ln.Addr().String(), workerID, session)
+	sticky := stickyEnabled && workerID != ""
+	if sticky {
+		egress.add(ln.Addr().String(), workerID, session)
+		defer egress.remove(ln.Addr().String(), workerID, session)
+	}
 
 	// Internal endpoint listener (proxyproto → metrics → admission layers).
 	epListener := newTCPListener(ln,
@@ -209,7 +213,7 @@ func (h *relayHandler) bindTCP(ctx context.Context, conn net.Conn, network, addr
 	//   1. Gets a stream from the mux session
 	//   2. Writes the peer address as AddrFeature on the mux stream
 	//   3. Pipes data bidirectionally
-	epHandler := newTCPHandler(session, ln.Addr().String(),
+	epHandler := newTCPHandler(session, ln.Addr().String(), sticky,
 		handler.ServiceOption(serviceName),
 		handler.LoggerOption(log.WithFields(map[string]any{
 			"kind": "handler",
