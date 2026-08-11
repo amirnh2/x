@@ -51,10 +51,33 @@ var stickyEnabled = func() bool {
 // maxPeek caps how many header bytes we read before giving up (slowloris guard).
 const maxPeek = 64 << 10
 
-// peekTimeout bounds the header read. Real ws traffic from nginx arrives at once,
-// so this never fires on the happy path; it only caps half-open / stalled peers
-// that connect but never send, which a deadline-less read would pin for minutes.
+// peekTimeout bounds the header read. Non-HTTP is rejected from its first bytes
+// (see startsLikeHTTP), so this never fires on real traffic — it only caps a peer
+// that connects and sends nothing (half-open), which a deadline-less read pins.
 const peekTimeout = 3 * time.Second
+
+// httpMethodPrefixes are the "METHOD " tokens an HTTP request line can begin with
+// (the ws upgrade is always GET). Used to reject non-HTTP from the first bytes.
+var httpMethodPrefixes = [][]byte{
+	[]byte("GET "), []byte("POST "), []byte("HEAD "), []byte("PUT "),
+	[]byte("DELETE "), []byte("OPTIONS "), []byte("PATCH "),
+	[]byte("CONNECT "), []byte("TRACE "),
+}
+
+// startsLikeHTTP reports whether buf is — or, while still shorter than a method
+// token, could still become — the start of an HTTP request line.
+func startsLikeHTTP(buf []byte) bool {
+	for _, m := range httpMethodPrefixes {
+		if len(buf) < len(m) {
+			if bytes.HasPrefix(m, buf) {
+				return true
+			}
+		} else if bytes.HasPrefix(buf, m) {
+			return true
+		}
+	}
+	return false
+}
 
 // egressRegistry holds the live mux sessions of every worker that has BIND'd a
 // given endpoint address, grouped by worker id, so an accepted connection can be
@@ -156,6 +179,12 @@ func peekHTTPHead(conn net.Conn) (head []byte, clientIP, host string) {
 		n, err := conn.Read(tmp)
 		if n > 0 {
 			buf = append(buf, tmp[:n]...)
+			// Fast path: the instant the bytes can't be an HTTP request line, stop
+			// and forward — don't wait for a \r\n\r\n that a non-HTTP protocol will
+			// never send. Only genuine HTTP reads on to the end of the headers.
+			if !startsLikeHTTP(buf) {
+				return buf, "", ""
+			}
 			if bytes.Contains(buf, []byte("\r\n\r\n")) {
 				break
 			}
