@@ -129,7 +129,17 @@ func (h *tcpHandler) Handle(ctx context.Context, conn net.Conn, opts ...handler.
 	var head []byte
 	if h.sticky {
 		var clientIP, host string
-		head, clientIP, host = peekHTTPHead(conn)
+		var isHTTP bool
+		head, clientIP, host, isHTTP = peekHTTPHead(conn)
+		if !isHTTP {
+			// Not HTTP on a worker (ws) endpoint: not our traffic. Drop it rather
+			// than forward noise into a worker's v2ray. Real ws from nginx always
+			// parses; this catches scanners / half-open peers. A valid request that
+			// merely lacks X-Real-IP/Host still parses (isHTTP=true) and is
+			// forwarded (unrouted) below — we never drop a real request.
+			log.Debugf("egress: non-HTTP on sticky endpoint %s, closing", h.bindAddr)
+			return nil
+		}
 		if clientIP != "" || host != "" {
 			if s := egress.pick(h.bindAddr, clientIP+"|"+host); s != nil {
 				sess = s

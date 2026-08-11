@@ -138,7 +138,7 @@ func (r *egressRegistry) pick(addr, key string) mux.Session {
 // (nginx's X-Real-IP, falling back to the first X-Forwarded-For hop) and the
 // Host. On any error it returns whatever was read plus empty fields, and the
 // caller forwards without routing.
-func peekHTTPHead(conn net.Conn) (head []byte, clientIP, host string) {
+func peekHTTPHead(conn net.Conn) (head []byte, clientIP, host string, isHTTP bool) {
 	conn.SetReadDeadline(time.Now().Add(peekTimeout))
 	defer conn.SetReadDeadline(time.Time{})
 
@@ -160,8 +160,9 @@ func peekHTTPHead(conn net.Conn) (head []byte, clientIP, host string) {
 
 	req, err := http.ReadRequest(bufio.NewReader(bytes.NewReader(buf)))
 	if err != nil {
-		return
+		return // isHTTP=false: no complete request head within the deadline/cap
 	}
+	isHTTP = true
 	host = req.Host
 	clientIP = req.Header.Get("X-Real-IP")
 	if clientIP == "" {
