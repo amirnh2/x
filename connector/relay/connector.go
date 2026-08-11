@@ -88,11 +88,15 @@ func (c *relayConnector) Connect(ctx context.Context, conn net.Conn, network, ad
 	}
 
 	if c.md.nodeID {
-		// pixelated fork: announce a stable self-derived worker id (egress IP,
-		// random fallback) in a DEDICATED metadata KV — not the auth username — so
-		// the relay never mistakes a real login for a sticky tunnel id.
+		// pixelated fork: announce a stable worker id in a DEDICATED metadata KV —
+		// not the auth username — so the relay never mistakes a real login for a
+		// tunnel id. Value = configured nodeIDValue, else auto (egress IP / random).
+		id := c.md.nodeIDValue
+		if id == "" {
+			id = nodeID()
+		}
 		req.Features = append(req.Features, &relay.MetadataFeature{
-			KVs: map[string]string{relay_util.MetaKeyNodeID: nodeID()},
+			KVs: map[string]string{relay_util.MetaKeyNodeID: id},
 		})
 	}
 	if c.options.Auth != nil {
