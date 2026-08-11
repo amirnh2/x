@@ -7,6 +7,8 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/libp2p/go-reuseport"
+
 	"github.com/go-gost/core/handler"
 	"github.com/go-gost/core/hosts"
 	"github.com/go-gost/core/limiter"
@@ -141,10 +143,12 @@ func (h *relayHandler) bindTCP(ctx context.Context, conn net.Conn, network, addr
 		Status:  relay.StatusOK,
 	}
 
-	lc := xnet.ListenConfig{
-		Netns: h.options.Netns,
-	}
-	ln, err := lc.Listen(ctx, network, address) // strict: port-in-use returns error
+	// pixelated fork: bind the endpoint port with SO_REUSEPORT so every worker's
+	// rtcp BIND can share the same port (many tunnels per port). The kernel's
+	// per-connection accept is no longer authoritative for egress — the endpoint
+	// handler (entrypoint.go) picks the destination worker by hash(client, host).
+	// NOTE: drops the Netns option (unused in this deployment); tcp only.
+	ln, err := reuseport.Listen(network, address)
 	if err != nil {
 		log.Error(err)
 		resp.Status = relay.StatusServiceUnavailable
@@ -183,6 +187,15 @@ func (h *relayHandler) bindTCP(ctx context.Context, conn net.Conn, network, addr
 	}
 	defer session.Close()
 
+	// pixelated fork: register this worker's session so accepted connections can
+	// be routed to a consistently-chosen worker (see egress_router.go). Worker id
+	// is the "user" the client presented in the relay auth feature; empty until
+	// the generator sets it — then all sessions fall in one group and routing
+	// degrades to the existing kernel lottery (no regression).
+	workerID := string(ctxvalue.ClientIDFromContext(ctx))
+	egress.add(ln.Addr().String(), workerID, session)
+	defer egress.remove(ln.Addr().String(), workerID, session)
+
 	// Internal endpoint listener (proxyproto → metrics → admission layers).
 	epListener := newTCPListener(ln,
 		listener.AddrOption(address),
@@ -196,7 +209,7 @@ func (h *relayHandler) bindTCP(ctx context.Context, conn net.Conn, network, addr
 	//   1. Gets a stream from the mux session
 	//   2. Writes the peer address as AddrFeature on the mux stream
 	//   3. Pipes data bidirectionally
-	epHandler := newTCPHandler(session,
+	epHandler := newTCPHandler(session, ln.Addr().String(),
 		handler.ServiceOption(serviceName),
 		handler.LoggerOption(log.WithFields(map[string]any{
 			"kind": "handler",

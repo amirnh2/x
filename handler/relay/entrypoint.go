@@ -79,19 +79,21 @@ func (l *tcpListener) Close() error {
 // the client that requested BIND receives forwarded connections as
 // streams on the mux session.
 type tcpHandler struct {
-	session mux.Session
-	options handler.Options
+	session  mux.Session
+	bindAddr string // registry key: the reuseport endpoint address (e.g. [::]:9596)
+	options  handler.Options
 }
 
-func newTCPHandler(session mux.Session, opts ...handler.Option) handler.Handler {
+func newTCPHandler(session mux.Session, bindAddr string, opts ...handler.Option) handler.Handler {
 	options := handler.Options{}
 	for _, opt := range opts {
 		opt(&options)
 	}
 
 	return &tcpHandler{
-		session: session,
-		options: options,
+		session:  session,
+		bindAddr: bindAddr,
+		options:  options,
 	}
 }
 
@@ -115,11 +117,37 @@ func (h *tcpHandler) Handle(ctx context.Context, conn net.Conn, opts ...handler.
 		}).Infof("%s >< %s", conn.RemoteAddr(), conn.LocalAddr())
 	}()
 
-	// Get a stream from the mux session.
-	cc, err := h.session.GetConn()
+	// pixelated fork: sticky egress routing. Peek the (cleartext, TLS already
+	// terminated by nginx) ws/HTTP head for the real client IP and config Host,
+	// then route to a consistently-chosen worker. The peeked bytes are replayed
+	// so the tunneled stream stays byte-exact. Falls back to h.session (the
+	// worker whose reuseport socket accepted this conn) when routing is disabled,
+	// the pool is empty, or the request can't be parsed.
+	sess := h.session
+	var head []byte
+	if stickyEnabled {
+		var clientIP, host string
+		head, clientIP, host = peekHTTPHead(conn)
+		if clientIP != "" || host != "" {
+			if s := egress.pick(h.bindAddr, clientIP+"|"+host); s != nil {
+				sess = s
+			}
+		}
+	}
+
+	// Get a stream from the chosen mux session.
+	cc, err := sess.GetConn()
 	if err != nil {
-		log.Error(err)
-		return err
+		// The chosen worker's session vanished between pick and GetConn; retry
+		// on the local session before giving up.
+		if sess != h.session {
+			log.Warnf("egress: chosen session unavailable (%v), falling back", err)
+			cc, err = h.session.GetConn()
+		}
+		if err != nil {
+			log.Error(err)
+			return err
+		}
 	}
 	defer cc.Close()
 
@@ -136,9 +164,15 @@ func (h *tcpHandler) Handle(ctx context.Context, conn net.Conn, opts ...handler.
 		return err
 	}
 
+	// Replay the peeked head (if any) ahead of the live stream.
+	var src net.Conn = conn
+	if len(head) > 0 {
+		src = &preReadConn{Conn: conn, pre: head}
+	}
+
 	t := time.Now()
 	log.Debugf("%s <-> %s", conn.RemoteAddr(), cc.RemoteAddr())
-	xnet.Pipe(ctx, conn, cc)
+	xnet.Pipe(ctx, src, cc)
 	log.WithFields(map[string]any{"duration": time.Since(t)}).
 		Debugf("%s >-< %s", conn.RemoteAddr(), cc.RemoteAddr())
 	return nil

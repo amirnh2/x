@@ -272,6 +272,13 @@ func (h *relayHandler) Handle(ctx context.Context, conn net.Conn, opts ...handle
 		ctx = xctx.ContextWithClientID(ctx, xctx.ClientID(clientID))
 	}
 
+	// pixelated fork: with no Auther, still propagate the client-declared user as
+	// the client id so the BIND endpoint can group a worker's sessions for sticky
+	// egress routing (see egress_router.go). The generator sets user = worker IP.
+	if h.options.Auther == nil && user != "" {
+		ctx = xctx.ContextWithClientID(ctx, xctx.ClientID(user))
+	}
+
 	network := networkID.String()
 	if (req.Cmd & relay.FUDP) == relay.FUDP {
 		network = "udp"
