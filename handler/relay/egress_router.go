@@ -74,17 +74,40 @@ func startsLikeHTTP(buf []byte) bool {
 	return false
 }
 
+// Circuit breaker: after breakerMaxFails consecutive fast forward-failures (a
+// worker's v2ray refused → the tunnel stream closes with an immediate EOF right
+// after the head), a worker is taken out of selection for breakerFailTimeout,
+// then re-probed. This is what lets a dead worker's load move to the others and
+// return to it when it recovers — the old per-connection lottery's resilience,
+// rebuilt on top of sticky routing.
+const (
+	breakerMaxFails    = 3
+	breakerFailTimeout = 30 * time.Second
+)
+
+// workerHealth tracks a worker's recent forward-failures for the circuit breaker.
+type workerHealth struct {
+	fails     int
+	deadUntil time.Time
+}
+
 // egressRegistry holds the live mux sessions of every worker that has BIND'd a
 // given endpoint address, grouped by worker id, so an accepted connection can be
 // routed to a consistently-chosen worker instead of whichever reuseport socket
-// happened to accept it.
+// happened to accept it. It also tracks per-worker forward-failure health so the
+// circuit breaker can exclude a worker whose v2ray is down.
 type egressRegistry struct {
 	mu sync.RWMutex
 	// bindAddr -> workerID -> set of live sessions
 	pools map[string]map[string]map[mux.Session]struct{}
+	// addr+"\x00"+workerID -> circuit-breaker health
+	health map[string]*workerHealth
 }
 
-var egress = &egressRegistry{pools: make(map[string]map[string]map[mux.Session]struct{})}
+var egress = &egressRegistry{
+	pools:  make(map[string]map[string]map[mux.Session]struct{}),
+	health: make(map[string]*workerHealth),
+}
 
 func (r *egressRegistry) add(addr, workerID string, s mux.Session) {
 	r.mu.Lock()
@@ -113,6 +136,7 @@ func (r *egressRegistry) remove(addr, workerID string, s mux.Session) {
 		delete(set, s)
 		if len(set) == 0 {
 			delete(byWorker, workerID)
+			delete(r.health, addr+"\x00"+workerID) // worker gone: forget its breaker state
 		}
 	}
 	if len(byWorker) == 0 {
@@ -120,42 +144,92 @@ func (r *egressRegistry) remove(addr, workerID string, s mux.Session) {
 	}
 }
 
-// pick chooses a live session for addr:
+// markFail records a fast forward-failure for a worker; after breakerMaxFails in
+// a row the worker is circuit-broken (skipped by pick) for breakerFailTimeout.
+func (r *egressRegistry) markFail(addr, workerID string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	key := addr + "\x00" + workerID
+	h := r.health[key]
+	if h == nil {
+		h = &workerHealth{}
+		r.health[key] = h
+	}
+	h.fails++
+	if h.fails >= breakerMaxFails {
+		h.deadUntil = time.Now().Add(breakerFailTimeout)
+	}
+}
+
+// markOK clears a worker's failure state after a successful forward.
+func (r *egressRegistry) markOK(addr, workerID string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if h := r.health[addr+"\x00"+workerID]; h != nil {
+		h.fails = 0
+		h.deadUntil = time.Time{}
+	}
+}
+
+// pickExcluding chooses a live session for addr, honoring the sticky hash and the
+// circuit breaker:
 //  1. rendezvous (HRW) hash of key over worker ids — the top worker is stable per
 //     key and only ~1/N of keys move when the worker set changes;
-//  2. any live session of that worker — Go's randomized map iteration spreads
-//     connections across the worker's many CF tunnels.
+//  2. skip workers in `tried` (already attempted for this connection) and workers
+//     the breaker currently holds dead;
+//  3. within the chosen worker, any live session — Go's randomized map iteration
+//     spreads connections across the worker's many CF tunnels.
 //
-// Returns nil if the pool is empty or the chosen worker has no live session
-// right now (rare race with deregistration); the caller then falls back to the
-// session that accepted the connection.
-func (r *egressRegistry) pick(addr, key string) mux.Session {
+// Two passes: the first honors the breaker; if that leaves nothing (every
+// candidate is dead or already tried), the second ignores the dead marks so we
+// still route somewhere rather than drop the connection — a cascade floor that
+// keeps a fleet-wide problem from emptying the pool. Returns the chosen session
+// and its worker id, or (nil, "") if the pool truly can't serve this connection;
+// the caller then falls back to the accepting session.
+func (r *egressRegistry) pickExcluding(addr, key string, tried map[string]bool) (mux.Session, string) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 
 	byWorker := r.pools[addr]
 	if len(byWorker) == 0 {
-		return nil
+		return nil, ""
 	}
+	now := time.Now()
 
-	var bestWorker string
-	var bestScore uint64
-	found := false
-	for workerID := range byWorker {
-		score := xxhash.Sum64String(workerID + "\x00" + key)
-		if !found || score > bestScore || (score == bestScore && workerID > bestWorker) {
-			found, bestWorker, bestScore = true, workerID, score
+	for _, honorBreaker := range []bool{true, false} {
+		var bestWorker string
+		var bestScore uint64
+		var bestSess mux.Session
+		found := false
+		for workerID, sessions := range byWorker {
+			if tried[workerID] {
+				continue
+			}
+			if honorBreaker {
+				if h := r.health[addr+"\x00"+workerID]; h != nil && now.Before(h.deadUntil) {
+					continue
+				}
+			}
+			var sess mux.Session
+			for s := range sessions {
+				if !s.IsClosed() {
+					sess = s
+					break
+				}
+			}
+			if sess == nil {
+				continue
+			}
+			score := xxhash.Sum64String(workerID + "\x00" + key)
+			if !found || score > bestScore || (score == bestScore && workerID > bestWorker) {
+				found, bestWorker, bestScore, bestSess = true, workerID, score, sess
+			}
+		}
+		if found {
+			return bestSess, bestWorker
 		}
 	}
-	if !found {
-		return nil
-	}
-	for s := range byWorker[bestWorker] {
-		if !s.IsClosed() {
-			return s
-		}
-	}
-	return nil
+	return nil, ""
 }
 
 // peekHTTPHead reads the request head (up to and including the end-of-headers

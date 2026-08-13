@@ -103,6 +103,11 @@ func (h *tcpHandler) Init(md md.Metadata) (err error) {
 	return
 }
 
+// maxForwardRetries bounds how many workers one connection will try before it
+// gives up and plain-forwards through the accepting session. Keeps a bad moment
+// (or a broad outage) from turning into a retry storm.
+const maxForwardRetries = 3
+
 func (h *tcpHandler) Handle(ctx context.Context, conn net.Conn, opts ...handler.HandleOption) error {
 	defer conn.Close()
 
@@ -119,45 +124,76 @@ func (h *tcpHandler) Handle(ctx context.Context, conn net.Conn, opts ...handler.
 		}).Infof("%s >< %s", conn.RemoteAddr(), conn.LocalAddr())
 	}()
 
-	// pixelated fork: sticky egress routing. Peek the (cleartext, TLS already
-	// terminated by nginx) ws/HTTP head for the real client IP and config Host,
-	// then route to a consistently-chosen worker. The peeked bytes are replayed
-	// so the tunneled stream stays byte-exact. Falls back to h.session (the
-	// worker whose reuseport socket accepted this conn) when routing is disabled,
-	// the pool is empty, or the request can't be parsed.
-	sess := h.session
+	// pixelated fork: sticky egress routing + failover. Peek the (cleartext, TLS
+	// already terminated by nginx) ws/HTTP head for the real client IP and config
+	// Host, then route to a consistently-chosen worker. If that worker's v2ray is
+	// down the forward fast-fails (the tunnel stream closes right after the head)
+	// and we retry the next-best worker; a worker that fails repeatedly is
+	// circuit-broken out of the pool so its load spreads to the others until it
+	// recovers — the old per-connection lottery's resilience, on top of sticky
+	// routing. Non-routable traffic (non-HTTP, or no X-Real-IP/Host) and any
+	// pool-exhaustion fall through to plain forwarding — identical to stock gost.
 	var head []byte
+	var key string
+	routed := false
 	if h.sticky {
-		// Peek the head; if it's a routable HTTP request, steer to the matching
-		// worker. Anything else — non-HTTP, or HTTP without X-Real-IP/Host — falls
-		// straight through to plain forwarding. The fork never drops or alters
-		// traffic it can't route, so behaviour stays identical to stock gost.
 		var clientIP, host string
 		head, clientIP, host = peekHTTPHead(conn)
 		if clientIP != "" || host != "" {
-			if s := egress.pick(h.bindAddr, clientIP+"|"+host); s != nil {
-				sess = s
-			}
+			key = clientIP + "|" + host
+			routed = true
 		}
 	}
 
-	// Get a stream from the chosen mux session.
-	cc, err := sess.GetConn()
+	if routed {
+		tried := make(map[string]bool)
+		for attempt := 0; attempt < maxForwardRetries; attempt++ {
+			sess, workerID := egress.pickExcluding(h.bindAddr, key, tried)
+			if sess == nil {
+				break // pool can't serve this connection → plain forward below
+			}
+			cc, err := sess.GetConn()
+			if err != nil {
+				// Session vanished (race with deregistration), not a v2ray fault:
+				// try another worker without counting it against the breaker.
+				tried[workerID] = true
+				continue
+			}
+			firstUp, ok := h.forwardProbe(cc, conn.RemoteAddr(), head)
+			if !ok {
+				// The worker's v2ray refused the forward: count it and move on.
+				egress.markFail(h.bindAddr, workerID)
+				tried[workerID] = true
+				cc.Close()
+				continue
+			}
+			egress.markOK(h.bindAddr, workerID)
+
+			// Committed. The head is already written to cc; firstUp (if any) is the
+			// worker's first response and must reach the client ahead of the stream.
+			var upstream net.Conn = cc
+			if len(firstUp) > 0 {
+				upstream = &preReadConn{Conn: cc, pre: firstUp}
+			}
+			t := time.Now()
+			log.Debugf("%s <-> %s (worker %s, try %d)", conn.RemoteAddr(), cc.RemoteAddr(), workerID, attempt)
+			xnet.Pipe(ctx, conn, upstream)
+			log.WithFields(map[string]any{"duration": time.Since(t)}).
+				Debugf("%s >-< %s", conn.RemoteAddr(), cc.RemoteAddr())
+			cc.Close()
+			return nil
+		}
+		log.Warnf("egress: no worker could serve %s (tried %d), plain-forwarding", key, maxForwardRetries)
+	}
+
+	// Plain forward through the session that accepted this connection (stock gost).
+	cc, err := h.session.GetConn()
 	if err != nil {
-		// The chosen worker's session vanished between pick and GetConn; retry
-		// on the local session before giving up.
-		if sess != h.session {
-			log.Warnf("egress: chosen session unavailable (%v), falling back", err)
-			cc, err = h.session.GetConn()
-		}
-		if err != nil {
-			log.Error(err)
-			return err
-		}
+		log.Error(err)
+		return err
 	}
 	defer cc.Close()
 
-	// Encode the peer address as an AddrFeature sent to the client through relay.
 	af := &relay.AddrFeature{}
 	af.ParseFrom(conn.RemoteAddr().String())
 	resp := relay.Response{
@@ -170,16 +206,50 @@ func (h *tcpHandler) Handle(ctx context.Context, conn net.Conn, opts ...handler.
 		return err
 	}
 
-	// Replay the peeked head (if any) ahead of the live stream.
 	var src net.Conn = conn
 	if len(head) > 0 {
 		src = &preReadConn{Conn: conn, pre: head}
 	}
-
-	t := time.Now()
-	log.Debugf("%s <-> %s", conn.RemoteAddr(), cc.RemoteAddr())
 	xnet.Pipe(ctx, src, cc)
-	log.WithFields(map[string]any{"duration": time.Since(t)}).
-		Debugf("%s >-< %s", conn.RemoteAddr(), cc.RemoteAddr())
 	return nil
+}
+
+// forwardProbe writes the relay response and the peeked head into the worker
+// stream, then reads the first upstream byte to tell a live v2ray (it answers —
+// e.g. the ws 101 — promptly) from a dead one (the worker can't dial v2ray and
+// closes the stream → immediate EOF). It returns the first upstream bytes to
+// replay to the client, and ok=false only on a fast forward-failure.
+//
+// For the ws handshake the client waits for that first response before sending
+// more, so reading it here adds no latency and never stalls the client. A v2ray
+// that ACCEPTS but never answers (hung, not refused — rare; a dead one refuses
+// instantly) would block here until the mux keepalive closes the session; a
+// per-stream read deadline would cap that, but the mux stream wrapper doesn't
+// expose one (it leaks to the shared conn), so it's left for later.
+func (h *tcpHandler) forwardProbe(cc net.Conn, clientAddr net.Addr, head []byte) (firstUp []byte, ok bool) {
+	af := &relay.AddrFeature{}
+	af.ParseFrom(clientAddr.String())
+	resp := relay.Response{
+		Version:  relay.Version1,
+		Status:   relay.StatusOK,
+		Features: []relay.Feature{af},
+	}
+	if _, err := resp.WriteTo(cc); err != nil {
+		return nil, false
+	}
+	if len(head) > 0 {
+		if _, err := cc.Write(head); err != nil {
+			return nil, false
+		}
+	}
+
+	b := make([]byte, 16<<10)
+	n, err := cc.Read(b)
+	if n > 0 {
+		return b[:n:n], true // v2ray answered (even a 4xx is a live response)
+	}
+	if err != nil {
+		return nil, false // stream closed before any byte → forward failed
+	}
+	return nil, true // 0 bytes, no error (unusual) → commit with nothing buffered
 }
